@@ -12,7 +12,7 @@ tags:
   - spend
   - cost-tracking
 author: WSO2 API Platform Documentation Team
-last_updated: 2026-09-16
+last_updated: 2026-10-20
 content_type: "how-to"
 ---
 
@@ -317,6 +317,10 @@ namespace where OpenTelemetry defines nothing, chiefly API-product concepts and 
 
     The publisher omits an attribute whose value is empty, rather than sending an empty string. The
     exact attribute set therefore varies per request.
+
+When [tracing](../logging-and-tracing/tracing.md) is enabled and the request was sampled, the log
+record's own `traceId` and `spanId` fields name the request's trace and the policy engine's span for
+it. A backend that supports the link can then go from the record to the trace.
 
 ### AI traffic
 
