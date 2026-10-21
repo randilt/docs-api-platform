@@ -8,13 +8,26 @@ tags:
   - observability
   - tracing
 author: WSO2 API Platform Documentation Team
-last_updated: 2026-06-17
+last_updated: 2026-10-20
 content_type: "reference"
 ---
 
 # Tracing Configuration
 
 ## Configuration Options
+
+### Export Protocol
+
+The router and the policy engine export spans with OTLP over gRPC by default. To export to a collector that accepts only OTLP over HTTP, set `protocol` to `http` and point `endpoint` at the collector's HTTP port:
+
+```toml
+[tracing]
+enabled = true
+protocol = "http"                  # "grpc" (default) or "http"
+endpoint = "otel-collector:4318"   # 4317 for grpc, 4318 for http
+```
+
+With `http`, spans are sent as OTLP protobuf to `/v1/traces` on the endpoint. If the endpoint has no port, the standard port for the protocol is used.
 
 ### Adjusting Sampling Rate
 
@@ -33,14 +46,19 @@ Sampling strategies:
 
 **Note:** Lower sampling rates reduce overhead but may miss important traces.
 
+The router makes the sampling decision. The policy engine follows it, so a request's spans are either all kept or all dropped. The rate applies only to a request that arrives with no trace context. A request whose `traceparent` header carries a sampling decision keeps that decision.
+
 
 ### Custom Service Names
 
-Customize service names for better identification:
+Customize the service names the router and the policy engine report:
 
 ```toml
+[router]
+tracing_service_name = "router-prod-us-east-1"
+
 [policy_engine]
-service_name = "policy-engine-prod-us-east-1"
+tracing_service_name = "policy-engine-prod-us-east-1"
 ```
 
 ### Batch Configuration
@@ -208,4 +226,8 @@ curl http://localhost:8080/weather/v1.0/us/seattle \
 ```
 
 This allows you to trace requests across your entire system, including services before and after the gateway.
+
+Each request is one trace. The policy engine's spans are children of the router's span for the request, so you see the router, every policy that ran, and the upstream call in one tree. A streamed request or response body is one span for the whole stream, with one span per policy. Policies that call other services through the gateway's shared HTTP client get a client span for each call, and the call carries the trace context to that service.
+
+Analytics events carry the trace too. A sampled request's analytics event includes its trace ID and span ID, so you can go from an event to its trace. The OpenTelemetry analytics publisher sets them as the log record's `traceId` and `spanId`, and traffic logs include `traceId`.
 
