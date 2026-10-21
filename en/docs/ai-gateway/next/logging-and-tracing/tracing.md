@@ -10,7 +10,7 @@ tags:
   - troubleshooting
   - opentelemetry
 author: WSO2 API Platform Documentation Team
-last_updated: 2026-08-20
+last_updated: 2026-10-20
 content_type: "how-to"
 ---
 
@@ -59,12 +59,20 @@ The tracing configuration is located in `gateway/configs/config.toml`:
 ```toml
 [tracing]
 enabled = true                          # Set to true to enable tracing
-endpoint = "otel-collector:4317"        # OTLP collector gRPC endpoint
+protocol = "grpc"                       # OTLP transport: "grpc" (port 4317) or "http" (port 4318)
+endpoint = "otel-collector:4317"        # OTLP collector endpoint
 service_version = "0.2.0"               # Service version
 batch_timeout = "1s"                    # Batch timeout for exporting spans
 max_export_batch_size = 512             # Maximum spans per batch
 sampling_rate = 1.0                     # Sample rate (1.0 = 100%, 0.5 = 50%)
+
+[tracing.genai]
+enabled = true                          # GenAI, MCP and agent spans (default: true)
+capture_content = false                 # Record prompts, completions and tool data (default: false)
+max_content_bytes = 16384               # Truncate each captured content attribute
 ```
+
+With `protocol = "http"`, spans are sent as OTLP protobuf to `/v1/traces` on the endpoint. Use it for a collector that accepts only OTLP over HTTP.
 
 ### Demonstrated Tracing Services
 
@@ -210,11 +218,14 @@ Sampling strategies:
 
 ### Custom Service Names
 
-Customize service names for better identification:
+Customize the service names the router and the policy engine report:
 
 ```toml
+[router]
+tracing_service_name = "router-prod-us-east-1"
+
 [policy_engine]
-service_name = "policy-engine-prod-us-east-1"
+tracing_service_name = "policy-engine-prod-us-east-1"
 ```
 
 ### Batch Configuration
@@ -229,6 +240,44 @@ max_export_batch_size = 1024    # Export up to 1024 spans per batch
 
 **Lower timeout**: Faster trace visibility, more network overhead
 **Higher timeout**: Better batching efficiency, slower trace visibility
+
+## GenAI, MCP and Agent Spans
+
+With `[tracing.genai]` enabled, the policy engine records a client span for each call the gateway makes to an LLM provider, an MCP server or an A2A agent. The spans follow the [OpenTelemetry GenAI and MCP semantic conventions](https://github.com/open-telemetry/semantic-conventions-genai/tree/06ec68e722c45a7218e23ea1bc1339fe4e21ecae/docs/gen-ai) (commit `06ec68e`, schema `gen-ai-dev/1.42.0-dev`), so backends that read `gen_ai.*` attributes show them without extra configuration. These conventions are still in development, and the attribute names may change in later releases.
+
+Each span is a child of the policy engine's `external_processing.process` span for the request. It starts when the request leaves the policy chain and ends with the last response byte, so its duration is the upstream's own time.
+
+| Route | Span name | Key attributes |
+| --- | --- | --- |
+| LLM provider | `{operation} {model}`, for example `chat gpt-4o` | `gen_ai.operation.name`, `gen_ai.provider.name`, `gen_ai.request.model`, `gen_ai.response.model`, `gen_ai.response.id`, `gen_ai.response.finish_reasons`, `gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens`, `gen_ai.usage.cache_read.input_tokens`, `gen_ai.usage.cache_write.input_tokens`, `gen_ai.usage.reasoning.output_tokens`, `gen_ai.request.stream`, `gen_ai.response.time_to_first_chunk`, `server.address`, `error.type` |
+| MCP proxy | `{method} {target}`, for example `tools/call get_weather` | `mcp.method.name`, `gen_ai.operation.name` (`execute_tool` for tool calls), `gen_ai.tool.name`, `gen_ai.prompt.name`, `mcp.resource.uri`, `jsonrpc.request.id`, `mcp.protocol.version`, `mcp.session.id`, `rpc.response.status_code`, `error.type` |
+| Agent (A2A) | `invoke_agent {agent}` | `gen_ai.operation.name`, `gen_ai.provider.name` (`a2a`), `gen_ai.agent.name`, `gen_ai.agent.version`, `gen_ai.conversation.id` (the A2A context ID), `a2a.message.id`, `a2a.task.id` |
+
+Notes:
+
+- **No call, no span.** A request a policy denies, such as one a guardrail blocks, makes no upstream call and records no client span. The denying policy's span records `wso2.policy.action = deny` and, for a guardrail, `wso2.guardrail.name`. Every policy span carries `wso2.policy.action` (`allow`, `modify` or `deny`).
+- **Errors.** An upstream error status sets `error.type` to the status code. On an MCP span, a JSON-RPC error sets `error.type` and `rpc.response.status_code` to the error code, and a tool result with `isError` sets `error.type = tool_error`.
+- **LLM proxies.** An LLM proxy forwards to its provider through the gateway, so the call appears twice. Only the provider route records the inference span, so tokens are counted once. The proxy route's `external_processing.process` span carries `wso2.ai.proxy` with the proxy's name.
+- **MCP trace context.** When an MCP request carries trace context in `params._meta`, the gateway reads it. If it belongs to a different trace from the HTTP request, the MCP span joins that trace and links to the HTTP request's trace. Before forwarding, the gateway sets `params._meta.traceparent` (and `tracestate`) to its MCP span, so the MCP server's spans nest under it. Other `_meta` members, such as `baggage`, are kept.
+- **Agent operations.** Only operations that send a message to the agent (`SendMessage`, `SendStreamingMessage`) record `invoke_agent`.
+
+### Cost of GenAI Spans
+
+Token usage and the response metadata are only in the response body. With GenAI spans enabled, the policy engine reads the request and response bodies of LLM provider routes, and the response body of the MCP route, even when no policy needs them. The reads do not change the traffic:
+
+- A request or buffered response larger than the router's buffer limit is still forwarded; the engine reads only the first part.
+- A streamed response, such as server-sent events, still streams to the client chunk by chunk. The engine keeps at most the first and last 256 KiB of the stream for the span.
+
+A2A responses are not read. To turn off GenAI spans and the extra reads, set `[tracing.genai] enabled = false`.
+
+### Capturing Content
+
+Prompts, completions and tool data can hold personal or confidential data, so they are not recorded by default. To record them, set `capture_content = true`. The spans then carry:
+
+- `gen_ai.input.messages`, `gen_ai.output.messages` and `gen_ai.system_instructions` on inference spans, in the OpenTelemetry message format. Content is captured for providers that use the OpenAI chat completions format (OpenAI, Azure OpenAI, Azure AI Foundry, Mistral) and the Anthropic Messages format. Other providers record no content.
+- `gen_ai.tool.call.arguments` and `gen_ai.tool.call.result` on MCP tool-call spans.
+
+The request is captured as forwarded, after masking and guardrail policies have run. Each attribute is cut to `max_content_bytes`, and the span is then marked `wso2.gen_ai.content.truncated = true`. Tool input or output larger than the limit is left out. Images and other inline media are not copied; the message only notes that they were there.
 
 ## Alternative Tracing Backends
 
@@ -694,6 +743,8 @@ curl http://localhost:8080/weather/v1.0/us/seattle \
 ```
 
 This allows you to trace requests across your entire system, including services before and after the gateway.
+
+The router makes the sampling decision and the policy engine follows it, so a request's spans are either all kept or all dropped. A sampled request's analytics event also carries its trace ID and span ID. See [OpenTelemetry Analytics](../analytics/opentelemetry-analytics.md).
 
 ## Best Practices
 
